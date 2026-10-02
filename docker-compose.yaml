@@ -52,7 +52,7 @@ services:
 
       echo 'Создание топиков...'
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 --config retention.ms=604800000
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scoring --partitions 3 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scores --partitions 3 --replication-factor 1 --config retention.ms=604800000
 
       echo 'Топики успешно созданы:'
       kafka-topics --bootstrap-server kafka:9092 --list
@@ -79,10 +79,51 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       KAFKA_TRANSACTIONS_TOPIC: "transactions"
-      KAFKA_SCORING_TOPIC: "scoring"
+      KAFKA_SCORES_TOPIC: "scores"
     depends_on:
-      - kafka
-      - kafka-setup
+      kafka-setup:
+        condition: service_completed_successfully  # Ждём, пока топики будут созданы
+    restart: unless-stopped
+
+  # База данных для витрины со скорами
+  postgres:
+    image: postgres:16-alpine
+    networks:
+      - ml-scorer
+    environment:
+      POSTGRES_DB: fraud
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: fraud
+    ports:
+      - "5433:5432"  # С хоста: localhost:5433 (5433, чтобы не конфликтовать с локальным Postgres)
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro  # Создаёт таблицу scores
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud -d fraud"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Сервис, перекладывающий результаты скоринга из Kafka в Postgres
+  db_writer:
+    build: ./db_writer
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_SCORES_TOPIC: "scores"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: fraud
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: fraud
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
   interface:
     build: ./interface
@@ -91,8 +132,16 @@ services:
     environment:
       KAFKA_BROKERS: "kafka:9092"  # Используем внутренний адрес Kafka
       KAFKA_TOPIC: "transactions"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: fraud
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: fraud
     depends_on:
-      - kafka
+      kafka-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     ports:
       - "8501:8501"
 
@@ -100,3 +149,6 @@ networks:
   ml-scorer:
     name: ml-scorer
     driver: bridge
+
+volumes:
+  pgdata:

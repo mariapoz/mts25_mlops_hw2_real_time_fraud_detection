@@ -1,15 +1,27 @@
 # Import standard libraries
-import pandas as pd
-import numpy as np
 import logging
+import os
 
-# Import extra modules
+import numpy as np
+import pandas as pd
 from geopy.distance import great_circle
-from sklearn.impute import SimpleImputer 
 
 logger = logging.getLogger(__name__)
-RANDOM_STATE = 42
 
+# Колонки, с которыми работает препроцессинг
+TARGET_COL = 'target'
+CATEGORICAL_COLS = ['gender', 'merch', 'cat_id', 'one_city', 'us_state', 'jobs']
+TIME_COLS = ['hour', 'year', 'month', 'day_of_month', 'day_of_week']
+CONTINUOUS_COLS = ['amount', 'population_city', 'distance']
+DROP_COLS = ['name_1', 'name_2', 'street', 'post_code']
+N_CATS = 50
+
+ARTIFACTS_PATH = os.getenv('PREPROC_ARTIFACTS_PATH', './models/preproc_artifacts.pkl')
+
+
+# ---------------------------------------------------------------------------
+# Простые преобразования, одинаковые для train и для потока
+# ---------------------------------------------------------------------------
 def add_time_features(df):
     logger.debug('Adding time features...')
     df['transaction_time'] = pd.to_datetime(df['transaction_time'])
@@ -23,24 +35,11 @@ def add_time_features(df):
     return df
 
 
-def cat_encode(train, input_df, col):
-    
-    logger.debug('Encoding category: %s', col)
-    new_col = col + '_cat'
-    mapping = train[[col, new_col]].drop_duplicates()
-    
-    # Merge to initial dataset
-    input_df = input_df.merge(mapping, how='left', on=col).drop(columns=col)
-    
-    return input_df
-
-
 def add_distance_features(df):
-    
     logger.debug('Calculating distances...')
     df['distance'] = df.apply(
         lambda x: great_circle(
-            (x['lat'], x['lon']), 
+            (x['lat'], x['lon']),
             (x['merchant_lat'], x['merchant_lon'])
         ).km,
         axis=1
@@ -48,104 +47,90 @@ def add_distance_features(df):
     return df.drop(columns=['lat', 'lon', 'merchant_lat', 'merchant_lon'])
 
 
-# Calculate means for encoding at docker container start
-def load_train_data():
+# ---------------------------------------------------------------------------
+# Офлайн-часть: считаем по train все статистики, которые нужны на inference.
+# Запускается ОДИН раз скриптом scripts/build_artifacts.py, результат
+# сохраняется в models/preproc_artifacts.pkl и кладётся в репозиторий.
+# ---------------------------------------------------------------------------
+def fit_artifacts(train: pd.DataFrame) -> dict:
+    """По сырому train считает таблицы кодирования, mean-encoding и средние для импутации."""
+    train = train.drop(columns=DROP_COLS, errors='ignore')
+    logger.info('Raw train data. Shape: %s', train.shape)
 
-    logger.info('Loading training data...')
-
-    # Define column types
-    target_col = 'target'
-    categorical_cols = ['gender', 'merch', 'cat_id', 'one_city', 'us_state', 'jobs']
-    n_cats = 50
-
-    # Import Train dataset
-    train = pd.read_csv('./train_data/train.csv').drop(columns=['name_1', 'name_2', 'street', 'post_code'])
-    logger.info('Raw train data imported. Shape: %s', train.shape)
-
-    # Add some simple time features
     train = add_time_features(train)
 
-    for col in categorical_cols:
+    # 1. Топ-N категорий: значение -> 'cat_0', 'cat_1', ..., 'cat_50+', 'cat_NAN'
+    cat_mappings = {}
+    for col in CATEGORICAL_COLS:
         new_col = col + '_cat'
-
-        # Get table of categories
-        temp_df = train\
-            .groupby(col, dropna=False)[[target_col]]\
-            .count()\
-            .sort_values(target_col, ascending=False)\
-            .reset_index()\
-            .set_axis([col, 'count'], axis=1)\
+        temp_df = train \
+            .groupby(col, dropna=False)[[TARGET_COL]] \
+            .count() \
+            .sort_values(TARGET_COL, ascending=False) \
+            .reset_index() \
+            .set_axis([col, 'count'], axis=1) \
             .reset_index()
         temp_df['index'] = temp_df.apply(lambda x: np.nan if pd.isna(x[col]) else x['index'], axis=1)
-        temp_df[new_col] = ['cat_NAN' if pd.isna(x) else 'cat_' + str(x) if x < n_cats else f'cat_{n_cats}+' for x in temp_df['index']]
+        temp_df[new_col] = [
+            'cat_NAN' if pd.isna(x) else 'cat_' + str(x) if x < N_CATS else f'cat_{N_CATS}+'
+            for x in temp_df['index']
+        ]
+        cat_mappings[col] = temp_df[[col, new_col]].drop_duplicates().reset_index(drop=True)
+        train = train.merge(cat_mappings[col], how='left', on=col)
 
-        train = train.merge(temp_df[[col, new_col]], how='left', on=col)
-    
-    # Calculate distance between a client and a merchant
     train = add_distance_features(train)
 
-    logger.info('Train data processed. Shape: %s', train.shape)
+    # 2. Mean target encoding для закодированных категорий и временных признаков
+    mean_tables = {}
+    for col in [c + '_cat' for c in CATEGORICAL_COLS] + TIME_COLS:
+        mean_tables[col] = train.groupby(col)[[TARGET_COL]].mean() \
+            .reset_index().rename(columns={TARGET_COL: f'{col}_mean_enc'})
 
-    return train
+    # 3. Средние для заполнения пропусков в непрерывных признаках
+    impute_means = train[CONTINUOUS_COLS].mean()
+
+    logger.info('Artifacts fitted on train of shape %s', train.shape)
+    return {
+        'cat_mappings': cat_mappings,
+        'mean_tables': mean_tables,
+        'impute_means': impute_means,
+    }
 
 
-# Main preprocessing function
-def run_preproc(train, input_df):
+def load_artifacts(path: str = ARTIFACTS_PATH) -> dict:
+    """Загружается при старте контейнера: маленький файл вместо всего train.csv."""
+    logger.info('Loading preprocessing artifacts from %s', path)
+    return pd.read_pickle(path)
 
-    # Define column types
-    target_col = 'target'
-    categorical_cols = ['gender', 'merch', 'cat_id', 'one_city', 'us_state', 'jobs']
-    continuous_cols = ['amount', 'population_city']
-    drop_col = ['name_1', 'name_2', 'street', 'post_code']
-    input_df = input_df.drop(columns=drop_col)
-    
-    # Run category encoding
-    for col in categorical_cols:
-        input_df = cat_encode(train, input_df, col)
 
-    logger.info('Categorical merging completed. Output shape: %s', input_df.shape)
-    
-    # Add some simple time features
+# ---------------------------------------------------------------------------
+# Онлайн-часть: препроцессинг входящих транзакций
+# ---------------------------------------------------------------------------
+def run_preproc(artifacts: dict, input_df: pd.DataFrame) -> pd.DataFrame:
+    input_df = input_df.drop(columns=DROP_COLS, errors='ignore')
+
+    # Кодирование категорий в 'cat_k' по таблицам, посчитанным на train
+    for col in CATEGORICAL_COLS:
+        input_df = input_df.merge(artifacts['cat_mappings'][col], how='left', on=col).drop(columns=col)
+    logger.debug('Categorical merging completed. Output shape: %s', input_df.shape)
+
     input_df = add_time_features(input_df)
 
-    logger.info('Added time features. Output shape: %s', input_df.shape)
-
-    categorical_cols = [x + '_cat' for x in categorical_cols]
-    categorical_cols.extend(['hour', 'year', 'month', 'day_of_month', 'day_of_week'])
-    
-    # Run mean ecoding for categorical variables
-    for col in categorical_cols:
-        # Fill empty values of categorical columns with some default category
+    # Mean target encoding
+    for col in [c + '_cat' for c in CATEGORICAL_COLS] + TIME_COLS:
+        # Неизвестные/пустые категории -> 'cat_NAN'
         input_df[col] = input_df[col].fillna('cat_NAN')
-    
-        # Create table of means
-        means_tb = train.groupby(col)[[target_col]].mean()\
-                        .reset_index().rename(columns={target_col:f'{col}_mean_enc'})
-        
-        # Join to datasets
-        input_df = input_df.merge(means_tb, how='left', on=col)
+        input_df = input_df.merge(artifacts['mean_tables'][col], how='left', on=col)
+    logger.debug('Categorical mean encoding completed. Output shape: %s', input_df.shape)
 
-    logger.info('Categorical mean encoding completed. Output shape: %s', input_df.shape)
-
-    # Calculate distance between a client and a merchant
     input_df = add_distance_features(input_df)
-    continuous_cols.extend(['distance'])
 
-    # Impute empty values with mean value
-    imputer = SimpleImputer(missing_values=np.nan, strategy='mean') 
-    imputer = imputer.fit(train[continuous_cols])
+    # Заполнение пропусков средним по train + log-преобразование
+    impute_means = artifacts['impute_means']
+    output_df = input_df.drop(columns=CONTINUOUS_COLS)
+    for col in CONTINUOUS_COLS:
+        filled = input_df[col].astype(float).fillna(impute_means[col])
+        output_df[col + '_log'] = np.log(filled + 1)
 
-    output_df = pd.concat([
-        input_df.drop(columns=continuous_cols),
-        pd.DataFrame(imputer.transform(input_df.copy()[continuous_cols]), columns=continuous_cols)
-    ], axis=1)
-
-    # Add log transformation
-    for col in continuous_cols:
-        output_df[col + '_log'] = np.log(output_df[col] + 1)
-        output_df.drop(columns=col, inplace=True)
-        
-    logger.info('Continuous features preprocessing completed. Output shape: %s', output_df.shape)
-    
-    # Return resulting dataset
+    logger.debug('Preprocessing completed. Output shape: %s', output_df.shape)
     return output_df
