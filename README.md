@@ -42,7 +42,7 @@
 - `src/preprocessing.py`: препроцессинг: временные признаки, расстояние клиент–мерчант, кодирование топ-50 категорий, mean target encoding, заполнение пропусков и log-преобразование.
 - `src/scorer.py`: загрузка модели `models/my_catboost.cbm` и скоринг. Если `score > 0.98`, то `fraud_flag = 1`.
 
-Сервис делает только inference. Все статистики, которые препроцессинг берёт из обучающей выборки (таблицы кодирования категорий, средние таргета, средние для импутации), посчитаны заранее скриптом `scripts/build_artifacts.py` и лежат в `models/preproc_artifacts.pkl`. Поэтому контейнеру не нужен `train.csv`.
+Сервис делает только inference. Все статистики, которые препроцессинг берёт из обучающей выборки (таблицы кодирования категорий, средние таргета, средние для импутации), посчитаны заранее скриптом `scripts/build_artifacts.py` и лежат в `models/preproc_artifacts.json`. Поэтому контейнеру не нужен `train.csv`.
 
 ### Формат сообщений
 
@@ -114,7 +114,7 @@ docker compose down -v     # остановить и удалить данные
 ```bash
 cd fraud_detector
 mkdir -p train_data && cp /path/to/train.csv train_data/
-python scripts/build_artifacts.py --train train_data/train.csv --out models/preproc_artifacts.pkl
+python scripts/build_artifacts.py --train train_data/train.csv --out models/preproc_artifacts.json
 ```
 
 ## Структура проекта
@@ -131,7 +131,7 @@ python scripts/build_artifacts.py --train train_data/train.csv --out models/prep
 │   ├── scripts/build_artifacts.py# офлайн-расчёт статистик по train
 │   ├── models/
 │   │   ├── my_catboost.cbm       # модель
-│   │   └── preproc_artifacts.pkl # статистики для препроцессинга
+│   │   └── preproc_artifacts.json # статистики для препроцессинга
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── db_writer/

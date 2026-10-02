@@ -1,4 +1,5 @@
 # Import standard libraries
+import json
 import logging
 import os
 
@@ -16,7 +17,7 @@ CONTINUOUS_COLS = ['amount', 'population_city', 'distance']
 DROP_COLS = ['name_1', 'name_2', 'street', 'post_code']
 N_CATS = 50
 
-ARTIFACTS_PATH = os.getenv('PREPROC_ARTIFACTS_PATH', './models/preproc_artifacts.pkl')
+ARTIFACTS_PATH = os.getenv('PREPROC_ARTIFACTS_PATH', './models/preproc_artifacts.json')
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +51,7 @@ def add_distance_features(df):
 # ---------------------------------------------------------------------------
 # Офлайн-часть: считаем по train все статистики, которые нужны на inference.
 # Запускается ОДИН раз скриптом scripts/build_artifacts.py, результат
-# сохраняется в models/preproc_artifacts.pkl и кладётся в репозиторий.
+# сохраняется в models/preproc_artifacts.json и кладётся в репозиторий.
 # ---------------------------------------------------------------------------
 def fit_artifacts(train: pd.DataFrame) -> dict:
     """По сырому train считает таблицы кодирования, mean-encoding и средние для импутации."""
@@ -97,10 +98,35 @@ def fit_artifacts(train: pd.DataFrame) -> dict:
     }
 
 
+def _df_to_records(df: pd.DataFrame) -> list:
+    # NaN -> None, чтобы получился валидный JSON
+    return [
+        {k: (None if pd.isna(v) else (v.item() if hasattr(v, 'item') else v)) for k, v in row.items()}
+        for row in df.to_dict(orient='records')
+    ]
+
+
+def save_artifacts(artifacts: dict, path: str) -> None:
+    """Сохраняет артефакты в JSON: формат не зависит от версий pandas/numpy."""
+    payload = {
+        'cat_mappings': {col: _df_to_records(df) for col, df in artifacts['cat_mappings'].items()},
+        'mean_tables': {col: _df_to_records(df) for col, df in artifacts['mean_tables'].items()},
+        'impute_means': {col: float(v) for col, v in artifacts['impute_means'].items()},
+    }
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
 def load_artifacts(path: str = ARTIFACTS_PATH) -> dict:
     """Загружается при старте контейнера: маленький файл вместо всего train.csv."""
     logger.info('Loading preprocessing artifacts from %s', path)
-    return pd.read_pickle(path)
+    with open(path, encoding='utf-8') as f:
+        payload = json.load(f)
+    return {
+        'cat_mappings': {col: pd.DataFrame(rows) for col, rows in payload['cat_mappings'].items()},
+        'mean_tables': {col: pd.DataFrame(rows) for col, rows in payload['mean_tables'].items()},
+        'impute_means': pd.Series(payload['impute_means']),
+    }
 
 
 # ---------------------------------------------------------------------------
